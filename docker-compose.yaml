@@ -1,4 +1,29 @@
 version: '3' 
+
+x-airflow-common: &airflow-common
+  environment:
+    &airflow-common-env
+    AIRFLOW_CORE_EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW_CORE_FERNET_KEY: ''
+    AIRFLOW__CORE_DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW_CORE_LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 5
+    _AIRFLOW_DB_MIGRATE: 'true'
+    _AIRFLOW_WWW_USER_CREATE: 'true'
+    _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
+    _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
+  volumes:
+    - data_lake:/mnt/data_lake
+    - ./airflow/dags:/opt/airflow/dags
+    - .airflow/logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - all_in_one
+
 services:
   namenode:
     image: bde2020/hadoop-namenode:1.1.0-hadoop2.8-java8
@@ -33,9 +58,10 @@ services:
     image: apache/nifi:latest
     container_name: nifi
     ports:
-      - 8080:8080 # Unsecured HTTP Web Port
+      - 8181:8080 # Unsecured HTTP Web Port
     volumes:
       - hadoop_conf:/mnt/hadoop
+      - data_lake:/home/nifi/tmp
     environment:
       - NIFI_WEB_HTTP_PORT=8080
       - NIFI_CLUSTER_IS_NODE=true
@@ -43,6 +69,107 @@ services:
       - NIFI_ZK_CONNECT_STRING=zookeeper:2181
       - NIFI_ELECTION_MAX_WAIT=1 min
       - NIFI_SENSITIVE_PROPS_KEY=qwertyuiopas
-  
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    restart: always
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "airflow" ]
+      interval: 5s
+      retries: 5
+    networks:
+      - all_in_one
+
+  clickhouse:
+    image: yandex/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - data_lake:/var/lib/clickhouse/user_files
+    networks:
+      - all_in_one
+
+  af-webserver:
+    <<: *airflow-common
+    build:
+      context: ./airflow_dockerfile
+      dockerfile: Dockerfile
+    container_name: af-webserver
+    environment:
+      *airflow-common-env
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+
+  af-scheduler:
+    <<: *airflow-common
+    build:
+      context: ./airflow_dockerfile
+      dockerfile: Dockerfile
+    container_name: af-scheduler
+    environment:
+      *airflow-common-env
+    command: scheduler
+    restart: always
+
+  af-worker:
+    <<: *airflow-common
+    build:
+      context: ./airflow_dockerfile
+      dockerfile: Dockerfile
+    container_name: af-worker
+    environment:
+      *airflow-common-env
+    command: version
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    build:
+      context: ./airflow_dockerfile
+      dockerfile: Dockerfile
+    container_name: airflow-init
+    command: version
+    restart: always
+    environment:
+      <<: *airflow-common-env
+
+  jupyter:
+    container_name: jupyter_notebook
+    build:
+      context: ./jupyter_dockerfile
+      dockerfile: Dockerfile
+    ports:
+      - "10000:8888"
+      - "4040:4040"
+    volumes:
+      - data_lake:/mnt/tmp/
+    command: bash -c "jupyter notebook --no-browser --NotebookApp.token='' --NotebookApp.password='' --ip='*' --allow-root && chmod 777 -R /mnt/tmp/"
+    environment:
+      - GRANT_SUDO=yes
+    user: root
+    restart: always
+    networks:
+      - all_in_one
+
 volumes:
   hadoop_conf:
+  data_lake:
+  postgres-db-volume:
+
+
+networks:
+  all_in_one:
